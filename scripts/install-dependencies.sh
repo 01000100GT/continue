@@ -64,7 +64,7 @@ popd
 echo "Installing binary dependencies..."
 pushd binary
 npm install
-npm run build
+npm run build:darwin-x64
 popd
 
 echo "Installing docs dependencies..."

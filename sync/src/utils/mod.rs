@@ -4,9 +4,11 @@ use tempfile::tempdir;
 
 #[derive(Default)]
 pub struct TempDirBuilder {
+    #[allow(dead_code)]
     files: Vec<(String, String)>,
 }
 
+#[allow(dead_code)]
 impl TempDirBuilder {
     pub fn new() -> Self {
         Self::default()

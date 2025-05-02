@@ -4,26 +4,35 @@ version = "0.1.0"
 description = "Continue Codebase Syncing"
 authors = ["Nate Sesti and Ty Dunn"]
 license = "Apache-2.0"
-edition = "2018"
+edition = "2021"
 exclude = ["index.node"]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+name = "sync"
+path = "src/lib.rs"
+
+# 添加example配置，允许示例代码使用本地库
+[[example]]
+name = "test_sample"
+path = "examples/test_sample.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 dirs = "5.0.1"
 hex-literal = "0.4.1"
-homedir = "0.2.1"
-ignore = "0.4.20"
+homedir = "0.3.4"
+ignore = "0.4"
 ndarray = "0.15.6"
 rand = "0.8.5"
 rusqlite = { version = "0.30.0", features = ["bundled"] }
-serde = { version = "1.0.192", features = ["derive"] }
-serde_json = "1.0.108"
-sha1 = "0.10.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
 tempfile = "3.8.1"
+walkdir = "2.3"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3.8.1"

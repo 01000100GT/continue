@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 pub fn local_find_gitignores(workspace_dir: &Path) -> io::Result<HashMap<PathBuf, String>> {
     let mut gitignores = HashMap::new();
     for entry in fs::read_dir(workspace_dir)? {
@@ -12,7 +13,10 @@ pub fn local_find_gitignores(workspace_dir: &Path) -> io::Result<HashMap<PathBuf
             gitignores.extend(local_find_gitignores(&path)?);
         } else {
             match path.file_name().and_then(|name| name.to_str()) {
-                Some(file_name) if file_name.ends_with(".gitignore") || file_name.ends_with(".continueignore") => {
+                Some(file_name)
+                    if file_name.ends_with(".gitignore")
+                        || file_name.ends_with(".continueignore") =>
+                {
                     let mut contents = String::new();
                     fs::File::open(&path)?.read_to_string(&mut contents)?;
                     gitignores.insert(path, contents);
@@ -24,17 +28,17 @@ pub fn local_find_gitignores(workspace_dir: &Path) -> io::Result<HashMap<PathBuf
     Ok(gitignores)
 }
 
-fn main() -> io::Result<()> {
-    let workspace_dir = Path::new("path/to/workspace");
-    let gitignore_map = local_find_gitignores(workspace_dir)?;
-    
-    // Print out the result (optional)
-    for (path, contents) in gitignore_map {
-        println!("{}:\n{}", path.display(), contents);
-    }
-    
-    Ok(())
-}
+// fn main() -> io::Result<()> {
+//     let workspace_dir = Path::new("path/to/workspace");
+//     let gitignore_map = local_find_gitignores(workspace_dir)?;
+
+//     // Print out the result (optional)
+//     for (path, contents) in gitignore_map {
+//         println!("{}:\n{}", path.display(), contents);
+//     }
+
+//     Ok(())
+// }
 
 #[cfg(test)]
 mod tests {

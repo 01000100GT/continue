@@ -1,0 +1,687 @@
+mod merkle;
+use homedir::get_my_home;
+use merkle::{compute_tree_for_dir, diff, hash_string};
+use std::{
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use fs2::FileExt;
+
+use self::merkle::{ObjDescription, Tree};
+
+#[derive(Clone)]
+pub struct Tag<'a> {
+    pub dir: &'a Path,
+    pub branch: &'a str,
+    pub provider_id: &'a str,
+}
+
+impl<'a> Tag<'a> {
+    pub fn to_string(&self) -> String {
+        return format!(
+            "{}::{}::{}",
+            self.dir.to_str().unwrap(),
+            self.branch,
+            self.provider_id
+        );
+    }
+}
+
+fn remove_seps_from_path(dir: &Path) -> String {
+    let mut path = String::new();
+    for component in dir.components() {
+        path.push_str(component.as_os_str().to_str().unwrap());
+    }
+
+    // Remove leading slash
+    if path.starts_with('/') || path.starts_with('\\') {
+        path.remove(0);
+    }
+    path
+}
+
+fn path_for_tag(tag: &Tag) -> PathBuf {
+    let mut path = get_my_home().unwrap().unwrap();
+    path.push(".continue/index/tags");
+    path.push(remove_seps_from_path(tag.dir));
+    path.push(tag.branch);
+    path.push(tag.provider_id);
+    return path;
+}
+
+/// Stored in ~/.continue/index/.last_sync
+fn get_last_sync_time(tag: &Tag) -> u64 {
+    // TODO: Error handle here
+    let path = path_for_tag(tag).join(".last_sync");
+
+//     let mut file = File::open(path).unwrap();
+//     let mut contents = String::new();
+//     file.read_to_string(&mut contents).unwrap();
+
+//     contents.parse::<u64>().unwrap()
+// }
+
+fn write_sync_time(tag: &Tag) {
+    let path = path_for_tag(tag).join(".last_sync");
+
+    let mut file = File::create(path).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    file.write_all(now.to_string().as_bytes()).unwrap();
+}
+
+/// Use stat to find files since last sync time
+pub fn get_modified_files(tag: &Tag) -> Vec<PathBuf> {
+    let last_sync_time = get_last_sync_time(tag);
+    let mut modified_files = Vec::new();
+    for entry in build_walk(tag.dir) {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let metadata = path.metadata().unwrap();
+        let modified = metadata.modified().unwrap();
+
+//     build_walk(dir)
+//         .filter_map(|entry| {
+//             let entry = entry.unwrap();
+//             let path = entry.path();
+//             let metadata = path.metadata().unwrap();
+//             let modified = metadata.modified().unwrap();
+
+//             if modified.duration_since(UNIX_EPOCH).unwrap().as_secs() > last_sync_time {
+//                 Some(path.to_path_buf())
+//             } else {
+//                 None
+//             }
+//         })
+//         .collect()
+// }
+
+// Merkle trees are unique to directories, even if nested, but .index_cache is shared between all
+
+struct DiskSet {
+    file: File,
+}
+
+const ITEM_SIZE: usize = 20;
+
+impl DiskSet {
+    pub fn new(path: &str) -> io::Result<Self> {
+        let path = Path::new(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            File::create(path)?;
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        Ok(Self { file })
+    }
+
+    pub fn contains(&mut self, item: &[u8; ITEM_SIZE]) -> io::Result<bool> {
+        self.file.lock_shared()?;
+        let result = (|| {
+            self.file.seek(SeekFrom::Start(0))?;
+            let mut buffer = [0; ITEM_SIZE];
+            loop {
+                match self.file.read_exact(&mut buffer) {
+                    Ok(_) => {
+                        if &buffer == item {
+                            return Ok(true);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(false)
+        })();
+        self.file.unlock()?;
+        result
+    }
+
+    pub fn add(&mut self, item: &[u8; ITEM_SIZE]) -> io::Result<()> {
+        self.file.lock_exclusive()?;
+        let result = (|| {
+            self.file.seek(SeekFrom::Start(0))?;
+            let mut buffer = [0; ITEM_SIZE];
+            let mut found = false;
+            loop {
+                match self.file.read_exact(&mut buffer) {
+                    Ok(_) => {
+                        if &buffer == item {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
+            if found {
+                return Ok(());
+            }
+
+            self.file.seek(SeekFrom::End(0))?;
+            self.file.write_all(item)?;
+            self.file.flush()?;
+            Ok(())
+        })();
+        self.file.unlock()?;
+        result
+    }
+
+    pub fn remove(&mut self, item: &[u8; ITEM_SIZE]) -> io::Result<()> {
+        self.file.lock_exclusive()?;
+        let result = (|| {
+            self.file.seek(SeekFrom::Start(0))?;
+            let mut buffer = [0; ITEM_SIZE];
+            let mut pos: u64 = 0;
+            let mut found = false;
+            loop {
+                let current_pos = self.file.stream_position()?;
+                match self.file.read_exact(&mut buffer) {
+                    Ok(_) => {
+                        if &buffer == item {
+                            pos = current_pos;
+                            found = true;
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
+            if found {
+                let metadata = self.file.metadata()?;
+                let len = metadata.len();
+
+                if len == 0 || len < ITEM_SIZE as u64 {
+                    return Ok(());
+                }
+                if len % ITEM_SIZE as u64 != 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "DiskSet file size is not a multiple of item size"));
+                }
+
+                let last_item_pos = len - ITEM_SIZE as u64;
+
+                if pos == last_item_pos {
+                    self.file.set_len(last_item_pos)?;
+                } else {
+                    let mut last_item_buffer = [0; ITEM_SIZE];
+                    self.file.seek(SeekFrom::Start(last_item_pos))?;
+                    self.file.read_exact(&mut last_item_buffer)?;
+                    self.file.seek(SeekFrom::Start(pos))?;
+                    self.file.write_all(&last_item_buffer)?;
+                    self.file.set_len(last_item_pos)?;
+                }
+                self.file.flush()?;
+            }
+            Ok(())
+        })();
+        self.file.unlock()?;
+        result
+    }
+}
+
+struct IndexCache<'a> {
+    tag: Box<Tag<'a>>,
+    global_cache: DiskSet,
+    tag_cache: DiskSet,
+}
+
+impl<'a> IndexCache<'a> {
+    fn index_cache_path_for_tag(tag: &Tag) -> PathBuf {
+        let mut path = path_for_tag(tag);
+        path.push(".index_cache");
+        path
+    }
+
+    fn rev_tags_dir(provider_id: &str) -> PathBuf {
+        let mut path = IndexCache::provider_dir(provider_id);
+        path.push("rev_tags");
+        return path;
+    }
+
+    fn rev_tags_path(hash: [u8; ITEM_SIZE], provider_id: &str) -> PathBuf {
+        let hash_str = hash_string(hash);
+        let mut path = IndexCache::rev_tags_dir(provider_id);
+        // Branch by 1) first two chars of hash
+        path.push(&hash_str[0..2]);
+        path
+    }
+
+    fn tag_str(&self) -> String {
+        return self.tag.to_string();
+    }
+
+    fn provider_dir(provider_id: &str) -> PathBuf {
+        let mut path = get_my_home().unwrap().unwrap();
+        path.push(".continue/index/providers");
+        path.push(provider_id);
+        return path;
+    }
+
+    fn new(tag: &'a Tag) -> io::Result<IndexCache<'a>> {
+        let provider_dir = IndexCache::provider_dir(tag.provider_id);
+        fs::create_dir_all(&provider_dir)?;
+        let tag_dir = path_for_tag(tag);
+        fs::create_dir_all(&tag_dir)?;
+        let rev_tags_parent = IndexCache::rev_tags_dir(tag.provider_id);
+        fs::create_dir_all(&rev_tags_parent)?;
+
+        let global_cache = DiskSet::new(
+            provider_dir
+                .join(".index_cache")
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid path string"))?,
+        )?;
+        let tag_cache = DiskSet::new(
+             IndexCache::index_cache_path_for_tag(tag)
+                 .to_str()
+                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid path string"))?,
+        )?;
+
+        Ok(IndexCache {
+            tag: Box::new(tag.clone()),
+            global_cache,
+            tag_cache,
+        })
+    }
+
+    // rev_tags files are just json files with the following format:
+    // { "hash": ["tag1", "tag2", ...], ... }
+
+    // TODO: You could add_bulk, remove_bulk if this gets slow
+    fn read_rev_tags(&self, hash: [u8; ITEM_SIZE]) -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
+        let rev_tags_path = IndexCache::rev_tags_path(hash, self.tag.provider_id);
+        if let Some(parent) = rev_tags_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let rev_tags_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&rev_tags_path)?;
+        
+        rev_tags_file.lock_shared()?;
+        let result = (|| {
+            let mut contents = String::new();
+            let mut reader_file = File::open(&rev_tags_path)?;
+            reader_file.read_to_string(&mut contents)?;
+
+            if contents.is_empty() {
+                Ok(HashMap::new())
+            } else {
+                serde_json::from_str(&contents).map_err(Box::from)
+            }
+        })();
+        rev_tags_file.unlock()?;
+        result
+    }
+
+    fn write_rev_tags(&self, hash: [u8; ITEM_SIZE], rev_tags: &HashMap<String, Vec<String>>) -> Result<(), Box<dyn std::error::Error>> {
+        let rev_tags_path = IndexCache::rev_tags_path(hash, self.tag.provider_id);
+        if let Some(parent) = rev_tags_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut rev_tags_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&rev_tags_path)?;
+
+        rev_tags_file.lock_exclusive()?;
+        let result = (|| {
+            let json = serde_json::to_string(rev_tags)?;
+            rev_tags_file.write_all(json.as_bytes())?;
+            rev_tags_file.flush()?;
+            Ok(())
+        })();
+        rev_tags_file.unlock()?;
+        result
+    }
+
+    fn add_global(&mut self, item: &ObjDescription) -> Result<(), Box<dyn std::error::Error>> {
+        self.global_cache.add(&item.hash)?;
+        self.tag_cache.add(&item.hash)?;
+
+        let mut rev_tags = self.read_rev_tags(item.hash)?;
+        let tag_str = self.tag_str();
+        let hash_str = hash_string(item.hash);
+        rev_tags.entry(hash_str).or_default().push(tag_str);
+        self.write_rev_tags(item.hash, &rev_tags)?;
+        Ok(())
+    }
+
+    fn global_remove(&mut self, item: &ObjDescription) -> Result<(), Box<dyn std::error::Error>> {
+        self.global_cache.remove(&item.hash)?;
+        self.tag_cache.remove(&item.hash)?;
+
+        let mut rev_tags = self.read_rev_tags(item.hash)?;
+        let hash_str = hash_string(item.hash);
+        if rev_tags.contains_key(&hash_str) {
+             rev_tags.remove(&hash_str);
+             self.write_rev_tags(item.hash, &rev_tags)?;
+        }
+        Ok(())
+    }
+
+    fn local_remove(&mut self, item: &ObjDescription) -> Result<(), Box<dyn std::error::Error>> {
+        self.tag_cache.remove(&item.hash)?;
+
+        let mut rev_tags = self.read_rev_tags(item.hash)?;
+        let tag_str = self.tag_str();
+        let hash_str = hash_string(item.hash);
+
+        let mut needs_write = false;
+        if let Some(tags) = rev_tags.get_mut(&hash_str) {
+            if let Some(index) = tags.iter().position(|x| *x == tag_str) {
+                tags.remove(index);
+                needs_write = true;
+                if tags.is_empty() {
+                    rev_tags.remove(&hash_str);
+                }
+            }
+        }
+
+        if needs_write {
+             self.write_rev_tags(item.hash, &rev_tags)?;
+        }
+        Ok(())
+    }
+
+    fn global_contains(&mut self, hash: &[u8; ITEM_SIZE]) -> io::Result<bool> {
+        self.global_cache.contains(hash)
+    }
+
+    fn get_rev_tags(hash: [u8; ITEM_SIZE], provider_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let rev_tags_path = IndexCache::rev_tags_path(hash, provider_id);
+        if let Some(parent) = rev_tags_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let rev_tags_file = OpenOptions::new().read(true).write(true).create(true).open(&rev_tags_path)?;
+        
+        rev_tags_file.lock_shared()?;
+        let result = (|| {
+            let mut reader_file = File::open(&rev_tags_path)?;
+            let mut contents = String::new();
+            reader_file.read_to_string(&mut contents)?;
+            let rev_tags_map: HashMap<String, Vec<String>> = if contents.is_empty() {
+                HashMap::new()
+            } else {
+                serde_json::from_str(&contents)?
+            };
+            let hash_str = hash_string(hash);
+            Ok(rev_tags_map.get(&hash_str).cloned().unwrap_or_else(Vec::new))
+        })();
+        rev_tags_file.unlock()?;
+        result
+    }
+}
+
+pub fn sync(
+    tag: &Tag,
+) -> Result<
+    (
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    // Make sure that the tag directory exists
+    // Create the directory and all its parent directories if they don't exist
+    fs::create_dir_all(path_for_tag(tag))?;
+    if let Some(parent) = IndexCache::rev_tags_path([0; ITEM_SIZE], tag.provider_id).parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut tree_path = path_for_tag(tag);
+    tree_path.push("merkle_tree");
+
+    let old_tree = Tree::load(&tree_path).unwrap_or_else(|err| {
+         eprintln!("Warning: Failed to load old Merkle tree: {}. Assuming empty tree.", err);
+         Tree::default()
+     });
+
+    // Calculate and save new tree
+    // TODO: Use modified files to speed up calculation
+    // let modified_files = get_modified_files(dir, branch);
+    let new_tree = compute_tree_for_dir(tag.dir, None)?;
+
+    // Update last sync time
+    write_sync_time(tag);
+
+    // Save new tree
+    new_tree.persist(&tree_path)?;
+
+    // Compute diff
+    let (add, remove) = diff(&old_tree, &new_tree);
+
+    // Compute the four action types: compute, remove, add tag, remove tag,
+    // transform into desired format: [(path, hash), ...],
+    // and update .index_cache
+    let mut index_cache = IndexCache::new(tag)?;
+
+    let mut compute: Vec<(String, String)> = Vec::new();
+    let mut delete: Vec<(String, String)> = Vec::new();
+    let mut add_label: Vec<(String, String)> = Vec::new();
+    let mut remove_label: Vec<(String, String)> = Vec::new();
+
+    for item in add {
+        if !item.is_blob {
+            continue;
+        }
+        let path = item.path.as_str().to_string();
+        let hash_str = hash_string(item.hash);
+
+        if index_cache.global_contains(&item.hash)? {
+            add_label.push((path, hash_str));
+            index_cache.add_global(&item)?;
+        } else {
+            compute.push((path, hash_str));
+            index_cache.add_global(&item)?;
+        }
+    }
+
+    for item in remove {
+        if !item.is_blob {
+            continue;
+        }
+        if index_cache.global_contains(&item.hash)? {
+            let rev_tags = IndexCache::get_rev_tags(item.hash, tag.provider_id)?;
+            if rev_tags.len() <= 1 {
+                index_cache.global_remove(&item)?;
+                let hash_str = hash_string(item.hash);
+                let path = item.path.as_str().to_string();
+                delete.push((path, hash_str));
+            } else {
+                index_cache.local_remove(&item)?;
+                let hash_str = hash_string(item.hash);
+                let path = item.path.as_str().to_string();
+                remove_label.push((path, hash_str));
+            }
+        } else {
+            eprintln!("Warning: Item {:?} removed but not found in global cache.", item.path);
+        }
+    }
+
+    Ok((compute, delete, add_label, remove_label))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{sync::merkle::ObjectHash, utils::TempDirBuilder};
+    use std::{fs::remove_file, io::{Seek, SeekFrom, Read}};
+
+    #[test]
+    fn test_disk_set() {
+        let path = "test_disk_set_file";
+        let mut disk_set = DiskSet::new(path).expect("Failed to create DiskSet");
+
+        let item1: ObjectHash = [1; ITEM_SIZE];
+        let item2: ObjectHash = [20; ITEM_SIZE];
+        let item3: ObjectHash = [30; ITEM_SIZE];
+
+        disk_set.add(&item1).expect("Failed to add item1");
+        disk_set.add(&item2).expect("Failed to add item2");
+        assert!(disk_set.contains(&item1).expect("Failed to check contains item1"));
+        assert!(disk_set.contains(&item2).expect("Failed to check contains item2"));
+
+        disk_set.file.seek(SeekFrom::Start(0)).unwrap();
+        let mut buffer = [0; ITEM_SIZE];
+        disk_set.file.read_exact(&mut buffer).unwrap();
+        assert_eq!(buffer, item1);
+        disk_set.file.read_exact(&mut buffer).unwrap();
+        assert_eq!(buffer, item2);
+
+        disk_set.remove(&item1).expect("Failed to remove item1");
+        assert!(!disk_set.contains(&item1).expect("Failed to check contains item1 after remove"));
+        assert!(disk_set.contains(&item2).expect("Failed to check contains item2 after remove item1"));
+
+        disk_set.add(&item3).expect("Failed to add item3");
+        assert!(disk_set.contains(&item3).expect("Failed to check contains item3"));
+
+        disk_set.file.seek(SeekFrom::Start(0)).unwrap();
+        let mut buffer = [0; ITEM_SIZE];
+        let mut count = 0;
+        while disk_set.file.read_exact(&mut buffer).is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+
+        remove_file(path).unwrap_or_else(|e| eprintln!("Warning: Failed to remove test file '{}': {}", path, e));
+    }
+
+    #[test]
+    fn test_sync() {
+        let ti = std::time::Instant::now();
+        let tag = Tag {
+            dir: Path::new("../"),
+            branch: "nate/pyO3",
+            provider_id: "default",
+        };
+        let results = sync(&tag);
+        println!("Sync took {:?}", ti.elapsed());
+        assert!(results.is_ok(), "Sync failed: {:?}", results.err());
+    }
+
+    #[test]
+    fn test_on_vscode_extension() {
+        let results = sync(&Tag {
+            dir: Path::new("../extensions/vscode"),
+            branch: "nate/pyO3",
+            provider_id: "default",
+        });
+        assert!(results.is_ok(), "Sync failed: {:?}", results.err());
+    }
+
+    #[test]
+    fn test_double_sync() {
+        let tag = Tag {
+            dir: Path::new("../"),
+            branch: "nate/pyO3_double_sync_test",
+            provider_id: "default",
+        };
+
+        let _ = fs::remove_dir_all(path_for_tag(&tag));
+
+        let ti = std::time::Instant::now();
+        let results1 = sync(&tag).expect("First sync failed.");
+        println!("First sync took {:?}", ti.elapsed());
+
+        let ti = std::time::Instant::now();
+        let results2 = sync(&tag).expect("Second sync failed");
+        println!("Second sync took {:?}", ti.elapsed());
+
+        assert!(results2.0.is_empty(), "Compute should be empty on second sync");
+        assert!(results2.1.is_empty(), "Delete should be empty on second sync");
+        assert!(results2.2.is_empty(), "AddLabel should be empty on second sync");
+        assert!(results2.3.is_empty(), "RemoveLabel should be empty on second sync");
+
+        let _ = fs::remove_dir_all(path_for_tag(&tag));
+    }
+
+    #[test]
+    fn test_sync_v3() {
+        // Create temp directory
+        let temp_dir = TempDirBuilder::new()
+            .add("dir1/file1.txt", "File 1")
+            .add("dir1/file2.txt", "File 2")
+            .add("dir2/file3.txt", "File 3")
+            .add("dir2/subdir/continue.py", "[continue for i in range(10)]")
+            .add("__init__.py", "a = 5")
+            .create();
+
+        let tag = &Tag {
+            dir: temp_dir.path(),
+            branch: "BRANCH_V3_1",
+            provider_id: "default",
+        };
+        sync(&tag).expect("Sync 1 failed.");
+
+        let mut file = File::create(temp_dir.path().join("dir1/file1.txt")).expect("Failed to open file1 for modify");
+        file.write_all(b"File 1 changed").expect("Failed to write file1");
+        drop(file);
+
+        let mut file = File::create(temp_dir.path().join("dir2/file3.txt")).expect("Failed to open file3 for modify");
+        file.write_all(b"File 3 changed").expect("Failed to write file3");
+        drop(file);
+
+        let results = sync(tag).expect("Sync 2 failed.");
+
+        assert_eq!(results.0.len(), 2, "Expected 2 computes");
+        assert_eq!(results.1.len(), 2, "Expected 2 deletes");
+        assert_eq!(results.2.len(), 0, "Expected 0 add_labels");
+        assert_eq!(results.3.len(), 0, "Expected 0 remove_labels");
+
+        let tag2 = &Tag {
+            dir: temp_dir.path(),
+            branch: "BRANCH_V3_2",
+            provider_id: "default",
+        };
+        let results = sync(tag2).expect("Sync 3 (new branch) failed.");
+
+        assert_eq!(results.0.len(), 0, "Expected 0 computes on new branch");
+        assert_eq!(results.1.len(), 0, "Expected 0 deletes on new branch");
+        assert_eq!(results.2.len(), 5, "Expected 5 add_labels on new branch");
+        assert_eq!(results.3.len(), 0, "Expected 0 remove_labels on new branch");
+
+        remove_file(temp_dir.path().join("dir1/file2.txt")).expect("Failed to remove file2");
+
+        let results = sync(tag2).expect("Sync 4 (after delete) failed.");
+
+        assert_eq!(results.0.len(), 0, "Expected 0 computes after delete");
+        assert_eq!(results.1.len(), 0, "Expected 0 deletes after delete");
+        assert_eq!(results.2.len(), 0, "Expected 0 add_labels after delete");
+        assert_eq!(results.3.len(), 1, "Expected 1 remove_label after delete");
+    }
+}

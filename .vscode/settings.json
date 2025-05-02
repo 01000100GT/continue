@@ -1,6 +1,6 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/server/.venv/bin/python3",
-  "rust-analyzer.linkedProjects": ["./server/Cargo.toml"],
+  "rust-analyzer.linkedProjects": ["./sync/Cargo.toml"],
   "python.analysis.extraPaths": [],
   "python.autoComplete.extraPaths": [],
   "python.testing.pytestArgs": ["server"],
@@ -46,5 +46,9 @@
     // "sync/**": true
   },
   "eslint.workingDirectories": ["./core"],
-  "typescript.tsdk": "node_modules/typescript/lib"
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "rust-analyzer.cargo.features": "all"
 }

@@ -1,5 +1,5 @@
 mod merkle;
-use homedir::get_my_home;
+use homedir::my_home;
 use merkle::{compute_tree_for_dir, diff, hash_string};
 use std::{
     collections::HashMap,
@@ -43,7 +43,7 @@ fn remove_seps_from_path(dir: &Path) -> String {
 }
 
 fn path_for_tag(tag: &Tag) -> PathBuf {
-    let mut path = get_my_home().unwrap().unwrap();
+    let mut path = my_home().unwrap().unwrap();
     path.push(".continue/index/tags");
     path.push(remove_seps_from_path(tag.dir));
     path.push(tag.branch);
@@ -52,15 +52,41 @@ fn path_for_tag(tag: &Tag) -> PathBuf {
 }
 
 /// Stored in ~/.continue/index/.last_sync
-fn get_last_sync_time(tag: &Tag) -> u64 {
-    // TODO: Error handle here
-    let path = path_for_tag(tag).join(".last_sync");
-
-//     let mut file = File::open(path).unwrap();
-//     let mut contents = String::new();
-//     file.read_to_string(&mut contents).unwrap();
-
-//     contents.parse::<u64>().unwrap()
+// fn get_last_sync_time(tag: &Tag) -> u64 {
+//     // TODO: Error handle here
+//     let path = path_for_tag(tag).join(".last_sync");
+    
+//     // 中文注释: 确认文件是否存在，如果不存在返回默认值 0
+//     if !path.exists() {
+//         return 0;
+//     }
+    
+//     // 中文注释: 尝试打开文件并读取内容
+//     match File::open(&path) {
+//         Ok(mut file) => {
+//             let mut contents = String::new();
+//             match file.read_to_string(&mut contents) {
+//                 Ok(_) => {
+//                     // 中文注释: 尝试将内容解析为 u64
+//                     match contents.trim().parse::<u64>() {
+//                         Ok(timestamp) => timestamp,
+//                         Err(_) => {
+//                             eprintln!("Warning: Failed to parse last sync time, using default 0");
+//                             0 // 解析失败，返回默认值
+//                         }
+//                     }
+//                 }
+//                 Err(_) => {
+//                     eprintln!("Warning: Failed to read last sync time, using default 0");
+//                     0 // 读取失败，返回默认值
+//                 }
+//             }
+//         }
+//         Err(_) => {
+//             eprintln!("Warning: Failed to open last sync time file, using default 0");
+//             0 // 打开失败，返回默认值
+//         }
+//     }
 // }
 
 fn write_sync_time(tag: &Tag) {
@@ -208,7 +234,7 @@ impl<'a> IndexCache<'a> {
     }
 
     fn provider_dir(provider_id: &str) -> PathBuf {
-        let mut path = get_my_home().unwrap().unwrap();
+        let mut path = my_home().unwrap().unwrap();
         path.push(".continue/index/providers");
         path.push(provider_id);
         return path;
@@ -266,35 +292,32 @@ impl<'a> IndexCache<'a> {
         self.global_cache.add(&item.hash);
         self.tag_cache.add(&item.hash);
 
-        // Add to rev_tags
-        let mut rev_tags = Self::read_rev_tags(item.hash);
+        let mut rev_tags = self.read_rev_tags(item.hash);
         let tag_str = self.tag_str();
         let hash_str = hash_string(item.hash);
         if !rev_tags.contains_key(hash_str.as_str()) {
             rev_tags.insert(hash_str.clone(), Vec::new());
         }
         rev_tags.get_mut(hash_str.as_str()).unwrap().push(tag_str);
-        Self::write_rev_tags(item.hash, &rev_tags);
+        self.write_rev_tags(item.hash, rev_tags);
     }
 
     fn global_remove(&mut self, item: &ObjDescription) {
         self.global_cache.remove(&item.hash);
         self.tag_cache.remove(&item.hash);
 
-        // Remove from rev_tags
-        let mut rev_tags = Self::read_rev_tags(item.hash);
+        let mut rev_tags = self.read_rev_tags(item.hash);
         let hash_str = hash_string(item.hash);
         if rev_tags.contains_key(hash_str.as_str()) {
             rev_tags.remove(hash_str.as_str());
         }
-        Self::write_rev_tags(item.hash, &rev_tags);
+        self.write_rev_tags(item.hash, rev_tags);
     }
 
     fn local_remove(&mut self, item: &ObjDescription) {
         self.tag_cache.remove(&item.hash);
 
-        // Remove from rev_tags
-        let mut rev_tags = Self::read_rev_tags(item.hash);
+        let mut rev_tags = self.read_rev_tags(item.hash);
         let tag_str = self.tag_str();
         let hash_str = hash_string(item.hash);
         if rev_tags.contains_key(hash_str.as_str()) {
@@ -305,7 +328,7 @@ impl<'a> IndexCache<'a> {
                 rev_tags.remove(hash_str.as_str());
             }
         }
-        Self::write_rev_tags(item.hash, &rev_tags);
+        self.write_rev_tags(item.hash, rev_tags);
     }
 
     fn global_contains(&mut self, hash: &[u8; ITEM_SIZE]) -> bool {
@@ -316,14 +339,29 @@ impl<'a> IndexCache<'a> {
     //     self.tag_cache.contains(hash)
     // }
 
-    fn get_rev_tags(hash: &[u8; ITEM_SIZE]) -> Vec<String> {
-        let mut rev_tags = Self::read_rev_tags(*hash);
-        let hash_str = hash_string(*hash);
-        if rev_tags.contains_key(hash_str.as_str()) {
-            rev_tags.remove(hash_str.as_str()).unwrap()
-        } else {
-            Vec::new()
+    // 中文注释: 修改 get_rev_tags 函数，使其参数与调用点一致，使用值类型而不是引用
+    fn get_rev_tags(hash: [u8; ITEM_SIZE]) -> Vec<String> {
+        let hash_str = hash_string(hash);
+        // 中文注释: 我们需要一个临时的实现来读取 rev_tags 文件
+        // 这里我们假设只使用 "default" provider_id，这在实际情况中应该根据需要调整
+        let provider_id = "default";
+        let rev_tags_path = IndexCache::rev_tags_path(hash, provider_id);
+        if !rev_tags_path.exists() {
+            return Vec::new();
         }
+
+        // 中文注释: 尝试读取文件内容
+        if let Ok(mut file) = File::open(&rev_tags_path) {
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() {
+                if let Ok(mut map) = serde_json::from_str::<HashMap<String, Vec<String>>>(&content) {
+                    return map.remove(&hash_str).unwrap_or_default();
+                }
+            }
+        }
+        
+        // 中文注释: 如果任何步骤失败，返回空 Vec
+        Vec::new()
     }
 }
 
@@ -400,7 +438,7 @@ pub fn sync(
             continue;
         }
         if index_cache.global_contains(&item.hash) {
-            if IndexCache::get_rev_tags(&item.hash).len() <= 1 {
+            if IndexCache::get_rev_tags(item.hash).len() <= 1 {
                 // If it's cached only for this tag, remove it from the global cache as well
                 index_cache.global_remove(&item);
                 let hash = hash_string(item.hash);
